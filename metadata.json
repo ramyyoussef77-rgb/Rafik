@@ -1,0 +1,7 @@
+{
+  "name": "رفيق (Rafeeq)",
+  "description": "An Arabic-only, Egypt-friendly, smart AI assistant that works without blocked services, feels human, and respects privacy, culture, and simplicity.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
