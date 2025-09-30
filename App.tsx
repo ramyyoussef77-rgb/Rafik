@@ -7,8 +7,14 @@ import MicrophoneIcon from './components/icons/MicrophoneIcon';
 import SendIcon from './components/icons/SendIcon';
 import ChatBubble from './components/ChatBubble';
 import Toast from './components/Toast';
+import { useChatHistory } from './hooks/useChatHistory';
+import TrashIcon from './components/icons/TrashIcon';
+import { useTextToSpeech } from './hooks/useTextToSpeech';
+import VolumeOnIcon from './components/icons/VolumeOnIcon';
+import VolumeOffIcon from './components/icons/VolumeOffIcon';
+import SunIcon from './components/icons/SunIcon';
 
-// Fix: Add types for the Web Speech API to the window object to resolve TS errors.
+// Add types for the Web Speech API to the window object to resolve TS errors.
 declare global {
   interface Window {
     SpeechRecognition: any;
@@ -18,7 +24,7 @@ declare global {
 
 // Initialize SpeechRecognition API
 const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-// Fix: Use 'any' type for the recognition instance to avoid conflict with the 'SpeechRecognition' variable.
+// Use 'any' type for the recognition instance to avoid conflict with the 'SpeechRecognition' variable.
 let recognition: any | null = null;
 if (SpeechRecognition) {
   recognition = new SpeechRecognition();
@@ -28,14 +34,32 @@ if (SpeechRecognition) {
 }
 
 const App: React.FC = () => {
-  const [messages, setMessages] = useState<Message[]>([]);
+  const { messages, setMessages, clearHistory } = useChatHistory();
   const [userInput, setUserInput] = useState<string>('');
   const [isLoading, setIsLoading] = useState<boolean>(false);
   const [isListening, setIsListening] = useState<boolean>(false);
   const [toast, setToast] = useState({ message: '', show: false });
+  const { speak, cancel, speakingMessageId } = useTextToSpeech();
+  const [isAutoSpeakEnabled, setIsAutoSpeakEnabled] = useState<boolean>(false);
+  const [theme, setTheme] = useState(() => {
+    if (typeof window !== 'undefined' && window.localStorage) {
+      return localStorage.getItem('theme') || 'light';
+    }
+    return 'light';
+  });
   const chatEndRef = useRef<HTMLDivElement>(null);
-  // Fix: Use 'any' type for the recognition ref to match the instance type.
+  // Use 'any' type for the recognition ref to match the instance type.
   const recognitionRef = useRef<any | null>(recognition);
+
+  useEffect(() => {
+    if (theme === 'dark') {
+      document.documentElement.classList.add('dark');
+      localStorage.setItem('theme', 'dark');
+    } else {
+      document.documentElement.classList.remove('dark');
+      localStorage.setItem('theme', 'light');
+    }
+  }, [theme]);
 
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -48,24 +72,28 @@ const App: React.FC = () => {
     recognitionInstance.onstart = () => setIsListening(true);
     recognitionInstance.onend = () => setIsListening(false);
     recognitionInstance.onerror = (event: any) => {
-      console.error('Speech recognition error', event.error);
+      // Using console.warn for permission issues as it's a user action, not a code bug.
+      console.warn('Speech recognition error:', event.error);
       if (event.error === 'not-allowed') {
-        showToast('يرجى السماح بالوصول إلى الميكروفون.');
+        showToast('تم رفض الوصول إلى الميكروفون. يرجى تمكينه في إعدادات المتصفح.');
       } else {
+        // More generic error
         showToast('حدث خطأ في التعرّف على الصوت.');
       }
       setIsListening(false);
     };
     recognitionInstance.onresult = (event: any) => {
+      // Add safety checks to prevent crashes from malformed results.
       const transcript = Array.from(event.results)
-        .map((result: any) => result[0])
-        .map((result: any) => result.transcript)
+        .map((result: any) => (result && result[0] ? result[0].transcript : ''))
         .join('');
       setUserInput(transcript);
     };
 
     return () => {
-      recognitionInstance.stop();
+      if (recognitionInstance.stop) {
+        recognitionInstance.stop();
+      }
     };
   }, []);
 
@@ -100,18 +128,23 @@ const App: React.FC = () => {
       sender: Sender.USER,
     };
 
-    setMessages((prev) => [...prev, newUserMessage]);
+    const updatedMessages = [...messages, newUserMessage];
+    setMessages(updatedMessages);
     setUserInput('');
     setIsLoading(true);
 
     try {
-      const aiResponseText = await askRafeeq(trimmedInput);
+      const recentHistory = updatedMessages.slice(-9, -1); // Get last 8 messages for context
+      const aiResponseText = await askRafeeq(trimmedInput, recentHistory);
       const newAiMessage: Message = {
         id: (Date.now() + 1).toString(),
         text: aiResponseText,
         sender: Sender.AI,
       };
       setMessages((prev) => [...prev, newAiMessage]);
+      if (isAutoSpeakEnabled) {
+        speak(aiResponseText, newAiMessage.id);
+      }
     } catch (error) {
       const errorMessage: Message = {
         id: (Date.now() + 1).toString(),
@@ -148,10 +181,16 @@ const App: React.FC = () => {
     }
 
     const userPrompt = messages[messageIndex - 1].text;
+    const historyForRegeneration = messages.slice(0, messageIndex - 1);
+    const recentHistoryForRegen = historyForRegeneration.slice(-8);
+
     setIsLoading(true);
 
     try {
-      const newResponseText = await askRafeeq(userPrompt);
+      const newResponseText = await askRafeeq(userPrompt, recentHistoryForRegen);
+      if (isAutoSpeakEnabled) {
+        speak(newResponseText, aiMessageId);
+      }
       setMessages(prev => 
         prev.map(msg => 
           msg.id === aiMessageId ? { ...msg, text: newResponseText } : msg
@@ -164,14 +203,22 @@ const App: React.FC = () => {
     }
   };
 
+  const handleClearHistory = () => {
+    clearHistory();
+    showToast('تم مسح المحادثة');
+  }
+  
+  const handleThemeToggle = () => {
+    setTheme(prevTheme => prevTheme === 'light' ? 'dark' : 'light');
+  };
 
   const InitialScreen = () => (
     <div className="flex flex-col items-center justify-center text-center h-full px-4">
-      <div className="flex items-center gap-3 mb-4 text-4xl font-bold text-stone-700">
+      <div className="flex items-center gap-3 mb-4 text-4xl font-bold text-stone-700 dark:text-stone-300">
         <h1 className="tracking-wide">رفيق</h1>
         <MoonIcon className="text-[#283593] w-8 h-8"/>
       </div>
-      <p className="text-stone-600 text-lg leading-relaxed">
+      <p className="text-stone-600 dark:text-stone-400 text-lg leading-relaxed">
         مرحباً! أنا رفيق.
         <br />
         اسألني أي شيء بالعربية —
@@ -182,25 +229,84 @@ const App: React.FC = () => {
       </p>
       <button 
         onClick={handleToggleListening}
-        className={`mt-12 bg-[#283593] hover:bg-indigo-900 text-white rounded-full p-6 shadow-lg transition-all transform hover:scale-105 ${isListening ? 'bg-red-600 animate-pulse' : ''}`}
+        className={`mt-12 bg-[#283593] hover:bg-indigo-900 text-white rounded-full p-6 shadow-lg transition-all transform hover:scale-105 ${isListening ? 'scale-105 shadow-lg shadow-red-500/50 animate-pulse' : ''}`}
         aria-label={isListening ? "إيقاف الاستماع" : "ابدأ المحادثة بالصوت"}
       >
         <MicrophoneIcon className="w-10 h-10" />
       </button>
-       <label htmlFor="chat-input" className="mt-6 text-stone-500">
-        {isListening ? 'جارِ الاستماع...' : 'اضغط واسألني أو اكتب سؤالك هنا...'}
+       <label htmlFor="chat-input" className="mt-6 text-stone-500 dark:text-stone-400">
+        {isListening ? 'رفيق يسمعك الآن...' : 'اضغط واسألني أو اكتب سؤالك هنا...'}
        </label>
-       <p className="mt-4 text-sm text-stone-400">
+       <p className="mt-4 text-sm text-stone-400 dark:text-stone-500">
         جرّب: ‘يا رفيق، كيف أركز في المذاكرة؟’
        </p>
     </div>
   );
 
+  const ActionButton = () => {
+    const hasText = userInput.trim().length > 0;
+  
+    if (hasText) {
+      return (
+        <button
+          type="submit"
+          aria-label="إرسال"
+          disabled={isLoading}
+          className="flex items-center justify-center w-11 h-11 rounded-full bg-[#283593] text-white transition-all duration-200 ease-in-out disabled:bg-stone-300 disabled:cursor-not-allowed transform hover:scale-110"
+        >
+          <SendIcon className="w-5 h-5" />
+        </button>
+      );
+    }
+  
+    return (
+      <button
+        type="button"
+        onClick={handleToggleListening}
+        aria-label={isListening ? "إيقاف الاستماع" : "بدء التسجيل الصوتي"}
+        disabled={isLoading || !SpeechRecognition}
+        className={`flex items-center justify-center w-11 h-11 rounded-full bg-[#283593] text-white transition-all duration-200 ease-in-out transform hover:scale-110 disabled:bg-stone-300 disabled:text-stone-400 disabled:cursor-not-allowed ${
+          isListening ? 'scale-110 shadow-lg shadow-red-500/50 animate-pulse' : ''
+        }`}
+      >
+        <MicrophoneIcon className="w-6 h-6" />
+      </button>
+    );
+  };
+
   return (
-    <div className="bg-stone-100 min-h-screen flex flex-col font-sans">
+    <div className="bg-stone-100 dark:bg-stone-900 min-h-screen flex flex-col font-sans">
        <Toast message={toast.message} show={toast.show} onClose={() => setToast({ ...toast, show: false })} />
-       <header className="bg-[#283593] text-white text-center p-4 shadow-md fixed top-0 w-full z-10">
-        <h1 className="text-xl font-bold">رفيق 🌙</h1>
+       <header className="bg-[#283593] text-white text-center p-4 shadow-md fixed top-0 w-full z-10 flex items-center justify-between">
+        <div className="w-1/3 flex items-center justify-start gap-4">
+            <button 
+                onClick={handleThemeToggle} 
+                aria-label="تبديل الوضع" 
+                className="text-white hover:text-indigo-200 transition-colors"
+                title="تبديل الوضع"
+            >
+                {theme === 'light' ? <MoonIcon className="w-6 h-6" /> : <SunIcon className="w-6 h-6" />}
+            </button>
+            <button 
+                onClick={handleClearHistory} 
+                aria-label="مسح المحادثة" 
+                className="text-white hover:text-indigo-200 transition-colors"
+                title="مسح المحادثة"
+            >
+                <TrashIcon className="w-6 h-6" />
+            </button>
+        </div>
+        <h1 className="text-xl font-bold w-1/3">رفيق 🌙</h1>
+        <div className="w-1/3 flex items-center justify-end">
+            <button 
+                onClick={() => setIsAutoSpeakEnabled(prev => !prev)} 
+                aria-label={isAutoSpeakEnabled ? "إيقاف القراءة التلقائية" : "تشغيل القراءة التلقائية"}
+                title={isAutoSpeakEnabled ? "إيقاف القراءة التلقائية" : "تشغيل القراءة التلقائية"}
+                className="text-white hover:text-indigo-200 transition-colors"
+            >
+                {isAutoSpeakEnabled ? <VolumeOnIcon className="w-6 h-6" /> : <VolumeOffIcon className="w-6 h-6" />}
+            </button>
+        </div>
       </header>
 
       <main className="flex-1 flex flex-col pt-20 pb-36">
@@ -208,18 +314,24 @@ const App: React.FC = () => {
           <InitialScreen />
         ) : (
           <div className="flex flex-col flex-1 px-4 space-y-2 overflow-y-auto">
-            {messages.map((msg) => (
-              <ChatBubble 
-                key={msg.id} 
-                message={msg} 
-                onCopy={handleCopy}
-                onFeedback={handleFeedback}
-                onRegenerate={handleRegenerate}
-              />
-            ))}
+            {messages.map((msg) => {
+              const isCurrentlySpeaking = msg.id === speakingMessageId;
+              return (
+                <ChatBubble 
+                  key={msg.id} 
+                  message={msg} 
+                  onCopy={handleCopy}
+                  onFeedback={handleFeedback}
+                  onRegenerate={handleRegenerate}
+                  onSpeak={() => speak(msg.text, msg.id)}
+                  onCancel={cancel}
+                  isSpeaking={isCurrentlySpeaking}
+                />
+              )
+            })}
             {isLoading && (
-              <div className="self-start flex flex-col items-center justify-center gap-3 bg-stone-200 text-stone-800 px-4 py-3 rounded-2xl shadow-sm w-full max-w-xs">
-                  <div className="w-6 h-6 border-4 border-stone-300 border-t-[#283593] rounded-full animate-spin"></div>
+              <div className="self-start flex flex-col items-center justify-center gap-3 bg-stone-200 dark:bg-stone-700 text-stone-800 dark:text-stone-300 px-4 py-3 rounded-2xl shadow-sm w-full max-w-xs">
+                  <div className="w-6 h-6 border-4 border-stone-300 dark:border-stone-500 border-t-[#283593] rounded-full animate-spin"></div>
                   <span>رفيق يفكّر جيدًا ليجيبك بإفادة...</span>
               </div>
             )}
@@ -228,40 +340,20 @@ const App: React.FC = () => {
         )}
       </main>
 
-      <div className="fixed bottom-16 right-0 w-full bg-stone-100/90 backdrop-blur-sm p-2 border-t border-stone-200">
-        <form onSubmit={handleSendMessage} className="max-w-md mx-auto flex items-center bg-white rounded-full border border-stone-300 shadow-sm">
+      <div className="fixed bottom-16 right-0 w-full bg-stone-100/90 dark:bg-stone-900/90 backdrop-blur-sm p-2 border-t border-stone-200 dark:border-stone-700">
+        <form onSubmit={handleSendMessage} className="max-w-md mx-auto flex items-center bg-white dark:bg-stone-800 rounded-full border border-stone-300 dark:border-stone-600 shadow-sm">
           <input
             id="chat-input"
             type="text"
             value={userInput}
             onChange={(e) => setUserInput(e.target.value)}
-            placeholder={isListening ? "جارِ الاستماع..." : "اكتب أو اسألني بصوتك..."}
-            className="flex-1 bg-transparent py-3 px-4 text-stone-800 placeholder-stone-400 focus:outline-none"
+            placeholder={isListening ? "رفيق يسمعك الآن..." : "اكتب أو اسألني بصوتك..."}
+            className="flex-1 bg-transparent py-3 px-4 text-stone-800 dark:text-stone-200 placeholder-stone-400 dark:placeholder-stone-500 focus:outline-none"
             autoComplete="off"
             disabled={isLoading}
           />
-          <div className="flex items-center p-1 gap-1">
-            <button
-              type="button"
-              onClick={handleToggleListening}
-              aria-label={isListening ? "إيقاف الاستماع" : "بدء التسجيل الصوتي"}
-              disabled={isLoading || !SpeechRecognition}
-              className={`flex items-center justify-center w-11 h-11 rounded-full transition-all duration-300 ease-in-out ${
-                isListening
-                  ? 'bg-red-200 text-red-700 scale-110 shadow-lg shadow-red-200/50'
-                  : 'bg-indigo-100 text-[#283593] hover:bg-indigo-200'
-              } disabled:bg-stone-200 disabled:text-stone-400 disabled:cursor-not-allowed`}
-            >
-              <MicrophoneIcon className="w-6 h-6" />
-            </button>
-            <button
-              type="submit"
-              aria-label="إرسال"
-              disabled={isLoading || !userInput.trim()}
-              className="flex items-center justify-center w-11 h-11 rounded-full bg-[#283593] text-white transition-colors disabled:bg-stone-300 disabled:cursor-not-allowed"
-            >
-              <SendIcon className="w-5 h-5" />
-            </button>
+          <div className="flex items-center p-1">
+            <ActionButton />
           </div>
         </form>
       </div>
