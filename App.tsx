@@ -1,364 +1,438 @@
-import React, { useState, useRef, useEffect } from 'react';
+
+import React, { useState, useRef, useEffect, useCallback } from 'react';
 import { Message, Sender } from './types';
-import { askRafeeq } from './services/geminiService';
+import { streamRafeeq, generateTitle } from './services/geminiService';
 import BottomNav from './components/BottomNav';
-import MoonIcon from './components/icons/MoonIcon';
-import MicrophoneIcon from './components/icons/MicrophoneIcon';
-import SendIcon from './components/icons/SendIcon';
 import ChatBubble from './components/ChatBubble';
 import Toast from './components/Toast';
-import { useChatHistory } from './hooks/useChatHistory';
-import TrashIcon from './components/icons/TrashIcon';
 import { useTextToSpeech } from './hooks/useTextToSpeech';
-import VolumeOnIcon from './components/icons/VolumeOnIcon';
-import VolumeOffIcon from './components/icons/VolumeOffIcon';
-import SunIcon from './components/icons/SunIcon';
-
-// Add types for the Web Speech API to the window object to resolve TS errors.
-declare global {
-  interface Window {
-    SpeechRecognition: any;
-    webkitSpeechRecognition: any;
-  }
-}
-
-// Initialize SpeechRecognition API
-const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-// Use 'any' type for the recognition instance to avoid conflict with the 'SpeechRecognition' variable.
-let recognition: any | null = null;
-if (SpeechRecognition) {
-  recognition = new SpeechRecognition();
-  recognition.continuous = true;
-  recognition.lang = 'ar-EG';
-  recognition.interimResults = true;
-}
+import { useSpeechRecognition } from './hooks/useSpeechRecognition';
+import TypingIndicator from './components/TypingIndicator';
+import InitialScreen from './components/InitialScreen';
+import StopButton from './components/StopButton';
+import ChatInputActionButton from './components/ChatInputActionButton';
+import Header from './components/Header';
+import SettingsPanel from './components/SettingsPanel';
+import HistoryPanel from './components/HistoryPanel';
+import PaperclipIcon from './components/icons/PaperclipIcon';
+import XCircleIcon from './components/icons/XCircleIcon';
+import { useChatSessions } from './hooks/useChatSessions';
 
 const App: React.FC = () => {
-  const { messages, setMessages, clearHistory } = useChatHistory();
+  const { 
+    sessions, 
+    activeSession, 
+    activeSessionId, 
+    setActiveSessionId, 
+    createNewSession,
+    updateActiveSessionMessages,
+    updateSessionTitle,
+    deleteSession,
+    clearAllSessions 
+  } = useChatSessions();
+
   const [userInput, setUserInput] = useState<string>('');
-  const [isLoading, setIsLoading] = useState<boolean>(false);
-  const [isListening, setIsListening] = useState<boolean>(false);
+  const [isThinking, setIsThinking] = useState<boolean>(false);
+  const [isStreaming, setIsStreaming] = useState<boolean>(false);
   const [toast, setToast] = useState({ message: '', show: false });
+  const [selectedImage, setSelectedImage] = useState<{ file: File, dataUrl: string } | null>(null);
   const { speak, cancel, speakingMessageId } = useTextToSpeech();
-  const [isAutoSpeakEnabled, setIsAutoSpeakEnabled] = useState<boolean>(false);
-  const [theme, setTheme] = useState(() => {
-    if (typeof window !== 'undefined' && window.localStorage) {
-      return localStorage.getItem('theme') || 'light';
-    }
-    return 'light';
-  });
+  const { 
+    isListening, 
+    transcript, 
+    startListening, 
+    stopListening, 
+    error: speechError, 
+    isSupported: isSpeechSupported 
+  } = useSpeechRecognition();
+  const [isAutoSpeakEnabled, setIsAutoSpeakEnabled] = useState<boolean>(() => localStorage.getItem('autoSpeak') === 'true');
+  const [theme, setTheme] = useState(() => localStorage.getItem('theme') || 'light');
+  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [isHistoryOpen, setIsHistoryOpen] = useState(false);
+  
   const chatEndRef = useRef<HTMLDivElement>(null);
-  // Use 'any' type for the recognition ref to match the instance type.
-  const recognitionRef = useRef<any | null>(recognition);
+  const stopGenerationRef = useRef<boolean>(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const textBuffer = useRef<string>("");
+  
+  useEffect(() => {
+    if (transcript) setUserInput(transcript);
+  }, [transcript]);
 
   useEffect(() => {
-    if (theme === 'dark') {
-      document.documentElement.classList.add('dark');
-      localStorage.setItem('theme', 'dark');
-    } else {
-      document.documentElement.classList.remove('dark');
-      localStorage.setItem('theme', 'light');
-    }
+    if (speechError) showToast(speechError);
+  }, [speechError]);
+
+  useEffect(() => {
+    document.documentElement.classList.toggle('dark', theme === 'dark');
+    localStorage.setItem('theme', theme);
   }, [theme]);
 
   useEffect(() => {
-    chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages, isLoading]);
+    localStorage.setItem('autoSpeak', String(isAutoSpeakEnabled));
+  }, [isAutoSpeakEnabled]);
 
   useEffect(() => {
-    const recognitionInstance = recognitionRef.current;
-    if (!recognitionInstance) return;
-
-    recognitionInstance.onstart = () => setIsListening(true);
-    recognitionInstance.onend = () => setIsListening(false);
-    recognitionInstance.onerror = (event: any) => {
-      // Using console.warn for permission issues as it's a user action, not a code bug.
-      console.warn('Speech recognition error:', event.error);
-      if (event.error === 'not-allowed') {
-        showToast('تم رفض الوصول إلى الميكروفون. يرجى تمكينه في إعدادات المتصفح.');
-      } else {
-        // More generic error
-        showToast('حدث خطأ في التعرّف على الصوت.');
-      }
-      setIsListening(false);
-    };
-    recognitionInstance.onresult = (event: any) => {
-      // Add safety checks to prevent crashes from malformed results.
-      const transcript = Array.from(event.results)
-        .map((result: any) => (result && result[0] ? result[0].transcript : ''))
-        .join('');
-      setUserInput(transcript);
-    };
-
-    return () => {
-      if (recognitionInstance.stop) {
-        recognitionInstance.stop();
-      }
-    };
-  }, []);
+    chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [activeSession?.messages, isThinking]);
 
   const showToast = (message: string) => {
     setToast({ message, show: true });
   };
+
+  const fileToBase64 = (file: File): Promise<{ data: string; mimeType: string }> => {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.readAsDataURL(file);
+      reader.onload = () => {
+        const result = reader.result as string;
+        const [meta, data] = result.split(',');
+        const mimeType = meta.split(':')[1].split(';')[0];
+        resolve({ data, mimeType });
+      };
+      reader.onerror = error => reject(error);
+    });
+  };
   
-  const handleToggleListening = () => {
-    if (!recognitionRef.current) {
-      showToast('عفواً، خاصية الصوت غير مدعومة في متصفحك.');
+  const handleImageSelect = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (file) {
+      const reader = new FileReader();
+      reader.onloadend = () => {
+        setSelectedImage({ file, dataUrl: reader.result as string });
+      };
+      reader.readAsDataURL(file);
+    }
+  };
+
+  const handleToggleListening = useCallback(() => {
+    if (!isSpeechSupported) {
+      showToast('المايك بتاعك شكله مش شغال على المتصفح ده.');
       return;
     }
-    if (isListening) {
-      recognitionRef.current.stop();
+    if (isListening) stopListening();
+    else {
+      setUserInput('');
+      startListening();
+    }
+  }, [isSpeechSupported, isListening, startListening, stopListening]);
+  
+  const handleNewChat = useCallback(() => {
+    createNewSession();
+    setIsHistoryOpen(false); // Close panel on new chat
+  }, [createNewSession]);
+  
+  const handleSelectSession = useCallback((sessionId: string) => {
+    setActiveSessionId(sessionId);
+    setIsHistoryOpen(false); // Close panel on selection
+  }, [setActiveSessionId]);
+
+  const handleDeleteSession = useCallback((sessionId: string) => {
+    deleteSession(sessionId);
+    showToast('الشات اتمسح');
+  }, [deleteSession]);
+
+  const handleSendMessage = async (messageText: string) => {
+    if (isListening) stopListening();
+    
+    const trimmedInput = messageText.trim();
+    if (!trimmedInput && !selectedImage) return;
+    if (!activeSession) return;
+
+    const newUserMessage: Message = { 
+      id: Date.now().toString(), 
+      text: trimmedInput, 
+      sender: Sender.USER,
+      imageUrl: selectedImage?.dataUrl,
+    };
+    
+    const isFirstMessage = activeSession.messages.length === 0;
+    updateActiveSessionMessages(prev => [...(prev || []), newUserMessage]);
+    setUserInput('');
+    
+    let imagePart;
+    if (selectedImage) {
+      try {
+        const { data, mimeType } = await fileToBase64(selectedImage.file);
+        imagePart = { inlineData: { data, mimeType } };
+      } catch (error) {
+        console.error("Error converting image:", error);
+        showToast("معلش، الصورة فيها مشكلة.");
+        return;
+      } finally {
+        setSelectedImage(null);
+      }
     } else {
-      setUserInput(''); // Clear input before starting
-      recognitionRef.current.start();
+        setSelectedImage(null);
+    }
+    
+    setIsThinking(true);
+    stopGenerationRef.current = false;
+    textBuffer.current = "";
+
+    if (isFirstMessage && activeSessionId) {
+        generateTitle(trimmedInput).then(title => {
+            updateSessionTitle(activeSessionId, title);
+        });
+    }
+
+    const recentHistory = activeSession.messages.slice(-9, -1);
+    const stream = streamRafeeq(trimmedInput, recentHistory, imagePart);
+    
+    let firstChunk = true;
+    const aiMessageId = (Date.now() + 1).toString();
+    
+    try {
+        for await (const chunk of stream) {
+            if (stopGenerationRef.current) break;
+            
+            if (firstChunk) {
+                setIsThinking(false);
+                setIsStreaming(true);
+                const newAiMessage: Message = { id: aiMessageId, text: chunk, sender: Sender.AI, streaming: true };
+                updateActiveSessionMessages(prev => [...(prev || []), newAiMessage]);
+                firstChunk = false;
+            } else {
+                updateActiveSessionMessages(prev => (prev || []).map(msg => 
+                    msg.id === aiMessageId ? { ...msg, text: msg.text + chunk } : msg
+                ));
+            }
+            
+            if (isAutoSpeakEnabled && !stopGenerationRef.current) {
+              textBuffer.current += chunk;
+              const sentences = textBuffer.current.split(/(?<=[.!?؟\n])/);
+              
+              if (sentences.length > 1) {
+                const completeSentences = sentences.slice(0, -1);
+                textBuffer.current = sentences[sentences.length - 1];
+                completeSentences.forEach(sentence => speak(sentence, aiMessageId));
+              }
+            }
+        }
+    } catch (error) {
+      console.error("Streaming failed:", error);
+      const errorMessage: Message = { id: aiMessageId, text: 'معلش يا غالي، حصلت مشكلة. ممكن تجرب تاني؟', sender: Sender.AI };
+      updateActiveSessionMessages(prev => [...(prev || []).filter(m => m.id !== aiMessageId), errorMessage]);
+    } finally {
+        setIsThinking(false);
+        setIsStreaming(false);
+
+        if (isAutoSpeakEnabled && !stopGenerationRef.current && textBuffer.current.trim()) {
+          speak(textBuffer.current, aiMessageId);
+        }
+        textBuffer.current = "";
+        
+        updateActiveSessionMessages(prev => 
+            (prev || []).map(msg => msg.id === aiMessageId ? { ...msg, streaming: false } : msg)
+        );
     }
   };
 
-  const handleSendMessage = async (e: React.FormEvent) => {
+  const handleFormSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    if(isListening) {
-      recognitionRef.current?.stop();
-    }
-    const trimmedInput = userInput.trim();
-    if (!trimmedInput) return;
-
-    const newUserMessage: Message = {
-      id: Date.now().toString(),
-      text: trimmedInput,
-      sender: Sender.USER,
-    };
-
-    const updatedMessages = [...messages, newUserMessage];
-    setMessages(updatedMessages);
-    setUserInput('');
-    setIsLoading(true);
-
-    try {
-      const recentHistory = updatedMessages.slice(-9, -1); // Get last 8 messages for context
-      const aiResponseText = await askRafeeq(trimmedInput, recentHistory);
-      const newAiMessage: Message = {
-        id: (Date.now() + 1).toString(),
-        text: aiResponseText,
-        sender: Sender.AI,
-      };
-      setMessages((prev) => [...prev, newAiMessage]);
-      if (isAutoSpeakEnabled) {
-        speak(aiResponseText, newAiMessage.id);
-      }
-    } catch (error) {
-      const errorMessage: Message = {
-        id: (Date.now() + 1).toString(),
-        text: 'عفواً، حدث خطأ. يرجى المحاولة مرة أخرى.',
-        sender: Sender.AI,
-      };
-      setMessages((prev) => [...prev, errorMessage]);
-    } finally {
-      setIsLoading(false);
-    }
+    handleSendMessage(userInput);
   };
   
-  const handleCopy = async (text: string) => {
+  const handlePromptClick = useCallback((prompt: string) => {
+    setUserInput(prompt);
+    setTimeout(() => handleSendMessage(prompt), 0);
+  }, []);
+
+  const handleStopGeneration = () => {
+    stopGenerationRef.current = true;
+    cancel();
+  };
+  
+  const handleCopy = useCallback(async (text: string) => {
     try {
       await navigator.clipboard.writeText(text);
-      showToast('تم النسخ إلى الحافظة');
+      showToast('اتنسخ يا غالي');
     } catch (err) {
-      showToast('فشل النسخ');
+      showToast('معلش، معرفتش أنسخها');
     }
-  };
+  }, []);
 
-  const handleFeedback = (feedback: 'like' | 'dislike') => {
-    if (feedback === 'like') {
-      showToast('شكرًا لتقديرك!');
-    } else {
-      showToast('آسف، سأتحسن!');
-    }
-  };
-
-  const handleRegenerate = async (aiMessageId: string) => {
-    const messageIndex = messages.findIndex(msg => msg.id === aiMessageId);
-    if (messageIndex < 1 || messages[messageIndex].sender !== Sender.AI) {
-      return;
-    }
-
-    const userPrompt = messages[messageIndex - 1].text;
-    const historyForRegeneration = messages.slice(0, messageIndex - 1);
-    const recentHistoryForRegen = historyForRegeneration.slice(-8);
-
-    setIsLoading(true);
-
-    try {
-      const newResponseText = await askRafeeq(userPrompt, recentHistoryForRegen);
-      if (isAutoSpeakEnabled) {
-        speak(newResponseText, aiMessageId);
+  const handleFeedback = useCallback((messageId: string, feedback: 'like' | 'dislike') => {
+    updateActiveSessionMessages(prev => (prev || []).map(msg => {
+      if (msg.id === messageId) {
+        return { ...msg, feedback: msg.feedback === feedback ? undefined : feedback };
       }
-      setMessages(prev => 
-        prev.map(msg => 
-          msg.id === aiMessageId ? { ...msg, text: newResponseText } : msg
-        )
-      );
+      return msg;
+    }));
+    showToast(feedback === 'like' ? 'حبيبي تسلم!' : 'تمام، هحاول أظبطها المرة الجاية');
+  }, [updateActiveSessionMessages]);
+
+  const handleRegenerate = useCallback(async (aiMessageId: string) => {
+    if (!activeSession) return;
+    const messageIndex = activeSession.messages.findIndex(msg => msg.id === aiMessageId);
+    if (messageIndex < 1) return;
+
+    const userMessage = activeSession.messages[messageIndex - 1];
+    const historyForRegen = activeSession.messages.slice(0, messageIndex - 1).slice(-8);
+
+    updateActiveSessionMessages(prev => (prev || []).map(msg => 
+      msg.id === aiMessageId ? { ...msg, text: '', streaming: true, feedback: undefined } : msg
+    ));
+
+    setIsStreaming(true);
+    stopGenerationRef.current = false;
+    textBuffer.current = "";
+    
+    let imagePart;
+    if (userMessage.imageUrl) {
+        // This requires re-fetching or storing the File object. For simplicity, we're not re-sending images on regenerate for now.
+    }
+    
+    const stream = streamRafeeq(userMessage.text, historyForRegen, imagePart);
+    try {
+        for await (const chunk of stream) {
+            if (stopGenerationRef.current) break;
+            updateActiveSessionMessages(prev => (prev || []).map(msg => 
+                msg.id === aiMessageId ? { ...msg, text: msg.text + chunk } : msg
+            ));
+            
+            if (isAutoSpeakEnabled && !stopGenerationRef.current) {
+              textBuffer.current += chunk;
+              const sentences = textBuffer.current.split(/(?<=[.!?؟\n])/);
+              if (sentences.length > 1) {
+                const completeSentences = sentences.slice(0, -1);
+                textBuffer.current = sentences[sentences.length - 1];
+                completeSentences.forEach(sentence => speak(sentence, aiMessageId));
+              }
+            }
+        }
     } catch (error) {
-      showToast('عفواً، فشلت إعادة الإنشاء.');
+      showToast('معلش، معرفتش أجيب إجابة تانية.');
     } finally {
-      setIsLoading(false);
+      setIsStreaming(false);
+       if (isAutoSpeakEnabled && !stopGenerationRef.current && textBuffer.current.trim()) {
+          speak(textBuffer.current, aiMessageId);
+        }
+        textBuffer.current = "";
+      updateActiveSessionMessages(prev => (prev || []).map(msg => 
+        msg.id === aiMessageId ? { ...msg, streaming: false } : msg
+      ));
     }
-  };
-
-  const handleClearHistory = () => {
-    clearHistory();
-    showToast('تم مسح المحادثة');
-  }
+  }, [activeSession, updateActiveSessionMessages, isAutoSpeakEnabled, speak]);
   
-  const handleThemeToggle = () => {
-    setTheme(prevTheme => prevTheme === 'light' ? 'dark' : 'light');
-  };
+  const handleSpeakMessage = useCallback((text: string, messageId: string) => {
+    const sentences = text.split(/(?<=[.!?؟\n])/);
+    sentences.forEach(sentence => {
+        if (sentence.trim()) {
+            speak(sentence.trim(), messageId);
+        }
+    });
+  }, [speak]);
 
-  const InitialScreen = () => (
-    <div className="flex flex-col items-center justify-center text-center h-full px-4">
-      <div className="flex items-center gap-3 mb-4 text-4xl font-bold text-stone-700 dark:text-stone-300">
-        <h1 className="tracking-wide">رفيق</h1>
-        <MoonIcon className="text-[#283593] w-8 h-8"/>
-      </div>
-      <p className="text-stone-600 dark:text-stone-400 text-lg leading-relaxed">
-        مرحباً! أنا رفيق.
-        <br />
-        اسألني أي شيء بالعربية —
-        <br />
-        من واجباتك إلى أحوال الطقس،
-        <br />
-        من أوقات الصلاة إلى نصائح يومية.
-      </p>
-      <button 
-        onClick={handleToggleListening}
-        className={`mt-12 bg-[#283593] hover:bg-indigo-900 text-white rounded-full p-6 shadow-lg transition-all transform hover:scale-105 ${isListening ? 'scale-105 shadow-lg shadow-red-500/50 animate-pulse' : ''}`}
-        aria-label={isListening ? "إيقاف الاستماع" : "ابدأ المحادثة بالصوت"}
-      >
-        <MicrophoneIcon className="w-10 h-10" />
-      </button>
-       <label htmlFor="chat-input" className="mt-6 text-stone-500 dark:text-stone-400">
-        {isListening ? 'رفيق يسمعك الآن...' : 'اضغط واسألني أو اكتب سؤالك هنا...'}
-       </label>
-       <p className="mt-4 text-sm text-stone-400 dark:text-stone-500">
-        جرّب: ‘يا رفيق، كيف أركز في المذاكرة؟’
-       </p>
-    </div>
-  );
-
-  const ActionButton = () => {
-    const hasText = userInput.trim().length > 0;
-  
-    if (hasText) {
-      return (
-        <button
-          type="submit"
-          aria-label="إرسال"
-          disabled={isLoading}
-          className="flex items-center justify-center w-11 h-11 rounded-full bg-[#283593] text-white transition-all duration-200 ease-in-out disabled:bg-stone-300 disabled:cursor-not-allowed transform hover:scale-110"
-        >
-          <SendIcon className="w-5 h-5" />
-        </button>
-      );
-    }
-  
-    return (
-      <button
-        type="button"
-        onClick={handleToggleListening}
-        aria-label={isListening ? "إيقاف الاستماع" : "بدء التسجيل الصوتي"}
-        disabled={isLoading || !SpeechRecognition}
-        className={`flex items-center justify-center w-11 h-11 rounded-full bg-[#283593] text-white transition-all duration-200 ease-in-out transform hover:scale-110 disabled:bg-stone-300 disabled:text-stone-400 disabled:cursor-not-allowed ${
-          isListening ? 'scale-110 shadow-lg shadow-red-500/50 animate-pulse' : ''
-        }`}
-      >
-        <MicrophoneIcon className="w-6 h-6" />
-      </button>
-    );
-  };
+  const handleClearHistory = useCallback(() => {
+    clearAllSessions();
+    showToast('كله اتمسح يا باشا');
+  }, [clearAllSessions]);
 
   return (
-    <div className="bg-stone-100 dark:bg-stone-900 min-h-screen flex flex-col font-sans">
+    <div className="bg-transparent min-h-screen flex flex-col font-sans">
        <Toast message={toast.message} show={toast.show} onClose={() => setToast({ ...toast, show: false })} />
-       <header className="bg-[#283593] text-white text-center p-4 shadow-md fixed top-0 w-full z-10 flex items-center justify-between">
-        <div className="w-1/3 flex items-center justify-start gap-4">
-            <button 
-                onClick={handleThemeToggle} 
-                aria-label="تبديل الوضع" 
-                className="text-white hover:text-indigo-200 transition-colors"
-                title="تبديل الوضع"
-            >
-                {theme === 'light' ? <MoonIcon className="w-6 h-6" /> : <SunIcon className="w-6 h-6" />}
-            </button>
-            <button 
-                onClick={handleClearHistory} 
-                aria-label="مسح المحادثة" 
-                className="text-white hover:text-indigo-200 transition-colors"
-                title="مسح المحادثة"
-            >
-                <TrashIcon className="w-6 h-6" />
-            </button>
-        </div>
-        <h1 className="text-xl font-bold w-1/3">رفيق 🌙</h1>
-        <div className="w-1/3 flex items-center justify-end">
-            <button 
-                onClick={() => setIsAutoSpeakEnabled(prev => !prev)} 
-                aria-label={isAutoSpeakEnabled ? "إيقاف القراءة التلقائية" : "تشغيل القراءة التلقائية"}
-                title={isAutoSpeakEnabled ? "إيقاف القراءة التلقائية" : "تشغيل القراءة التلقائية"}
-                className="text-white hover:text-indigo-200 transition-colors"
-            >
-                {isAutoSpeakEnabled ? <VolumeOnIcon className="w-6 h-6" /> : <VolumeOffIcon className="w-6 h-6" />}
-            </button>
-        </div>
-      </header>
+       <Header onMenuClick={() => setIsSettingsOpen(true)} />
+       <SettingsPanel
+          isOpen={isSettingsOpen}
+          onClose={() => setIsSettingsOpen(false)}
+          theme={theme}
+          onThemeToggle={() => setTheme(p => p === 'light' ? 'dark' : 'light')}
+          isAutoSpeakEnabled={isAutoSpeakEnabled}
+          onAutoSpeakToggle={() => setIsAutoSpeakEnabled(p => !p)}
+          onClearHistory={handleClearHistory}
+       />
+       <HistoryPanel
+          isOpen={isHistoryOpen}
+          onClose={() => setIsHistoryOpen(false)}
+          sessions={sessions}
+          activeSessionId={activeSessionId}
+          onSelectSession={handleSelectSession}
+          onNewSession={handleNewChat}
+          onDeleteSession={handleDeleteSession}
+       />
 
-      <main className="flex-1 flex flex-col pt-20 pb-36">
-        {messages.length === 0 && !isLoading ? (
-          <InitialScreen />
+      <main className="flex-1 flex flex-col pt-20 pb-36 bg-transparent">
+        {(!activeSession || activeSession.messages.length === 0) && !isThinking ? (
+          <InitialScreen onListenClick={handleToggleListening} onPromptClick={handlePromptClick} isListening={isListening} />
         ) : (
           <div className="flex flex-col flex-1 px-4 space-y-2 overflow-y-auto">
-            {messages.map((msg) => {
-              const isCurrentlySpeaking = msg.id === speakingMessageId;
-              return (
-                <ChatBubble 
-                  key={msg.id} 
-                  message={msg} 
-                  onCopy={handleCopy}
-                  onFeedback={handleFeedback}
-                  onRegenerate={handleRegenerate}
-                  onSpeak={() => speak(msg.text, msg.id)}
-                  onCancel={cancel}
-                  isSpeaking={isCurrentlySpeaking}
-                />
-              )
-            })}
-            {isLoading && (
-              <div className="self-start flex flex-col items-center justify-center gap-3 bg-stone-200 dark:bg-stone-700 text-stone-800 dark:text-stone-300 px-4 py-3 rounded-2xl shadow-sm w-full max-w-xs">
-                  <div className="w-6 h-6 border-4 border-stone-300 dark:border-stone-500 border-t-[#283593] rounded-full animate-spin"></div>
-                  <span>رفيق يفكّر جيدًا ليجيبك بإفادة...</span>
-              </div>
-            )}
+            {activeSession?.messages.map((msg) => (
+              <ChatBubble 
+                key={msg.id} 
+                message={msg} 
+                onCopy={handleCopy}
+                onFeedback={handleFeedback}
+                onRegenerate={() => handleRegenerate(msg.id)}
+                onSpeak={() => handleSpeakMessage(msg.text, msg.id)}
+                onCancel={cancel}
+                isSpeaking={msg.id === speakingMessageId}
+              />
+            ))}
+            {isThinking && <TypingIndicator />}
             <div ref={chatEndRef} />
           </div>
         )}
       </main>
 
       <div className="fixed bottom-16 right-0 w-full bg-stone-100/90 dark:bg-stone-900/90 backdrop-blur-sm p-2 border-t border-stone-200 dark:border-stone-700">
-        <form onSubmit={handleSendMessage} className="max-w-md mx-auto flex items-center bg-white dark:bg-stone-800 rounded-full border border-stone-300 dark:border-stone-600 shadow-sm">
+        {isStreaming && <StopButton onClick={handleStopGeneration} />}
+        {selectedImage && (
+            <div className="max-w-md mx-auto flex justify-start items-center pb-2 px-2">
+                <div className="relative">
+                    <img src={selectedImage.dataUrl} alt="Preview" className="h-16 w-16 rounded-lg object-cover" />
+                    <button 
+                        onClick={() => setSelectedImage(null)}
+                        className="absolute -top-2 -right-2 bg-stone-800 rounded-full text-white"
+                        aria-label="Remove image"
+                    >
+                        <XCircleIcon className="w-6 h-6"/>
+                    </button>
+                </div>
+            </div>
+        )}
+        <form onSubmit={handleFormSubmit} className="max-w-md mx-auto flex items-center bg-white dark:bg-stone-800 rounded-full border border-stone-300 dark:border-stone-600 shadow-sm">
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="image/*"
+            onChange={handleImageSelect}
+            className="hidden"
+          />
+          <button
+            type="button"
+            onClick={() => fileInputRef.current?.click()}
+            className="p-3 text-stone-500 hover:text-[#283593] dark:text-stone-400 dark:hover:text-indigo-400"
+            aria-label="Attach image"
+            disabled={isThinking || isStreaming}
+          >
+            <PaperclipIcon className="w-6 h-6"/>
+          </button>
           <input
             id="chat-input"
             type="text"
             value={userInput}
             onChange={(e) => setUserInput(e.target.value)}
-            placeholder={isListening ? "رفيق يسمعك الآن..." : "اكتب أو اسألني بصوتك..."}
-            className="flex-1 bg-transparent py-3 px-4 text-stone-800 dark:text-stone-200 placeholder-stone-400 dark:placeholder-stone-500 focus:outline-none"
+            placeholder={isListening ? "سامعك يا غالي، قول..." : "اكتب أو اسألني بصوتك..."}
+            className="flex-1 bg-transparent py-3 px-2 text-stone-800 dark:text-stone-200 placeholder-stone-400 dark:placeholder-stone-500 focus:outline-none"
             autoComplete="off"
-            disabled={isLoading}
+            disabled={isThinking || isStreaming}
           />
           <div className="flex items-center p-1">
-            <ActionButton />
+            <ChatInputActionButton 
+              userInput={userInput}
+              hasImage={!!selectedImage}
+              isThinking={isThinking}
+              isStreaming={isStreaming}
+              isListening={isListening}
+              isSpeechSupported={isSpeechSupported}
+              onMicClick={handleToggleListening}
+            />
           </div>
         </form>
       </div>
 
-      <BottomNav />
+      <BottomNav onNewChat={handleNewChat} onHistoryClick={() => setIsHistoryOpen(true)} onSettingsClick={() => setIsSettingsOpen(true)} />
     </div>
   );
 };
